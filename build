@@ -1,0 +1,22 @@
+#!/bin/bash -e
+if [[ "$#" -ne 1 ]]; then
+    echo "Usage: build <zip-target>" 1>&2;
+    exit 1;
+fi;
+
+ZIP_TARGET="$1"
+export GOOS=$(echo $ZIP_TARGET | sed -E -e 's/^s3-tree-clone-([^-]+)-.*/\1/')
+export GOARCH=$(echo $ZIP_TARGET | sed -E -e 's/^s3-tree-clone-[^-]+-([^-]+).*/\1/')
+
+echo "Building s3-tree-clone-$GOOS-$GOARCH"
+go build -o s3-tree-clone-$GOOS-$GOARCH
+
+echo "Creating $ZIP_TARGET"
+rm -rf tmp-$GOOS-$GOARCH
+mkdir -p tmp-$GOOS-$GOARCH
+cp s3-tree-clone-$GOOS-$GOARCH tmp-$GOOS-$GOARCH/s3-tree-clone
+cd tmp-$GOOS-$GOARCH
+zip -9 ../${ZIP_TARGET} s3-tree-clone
+rm -f s3-tree-clone
+cd ..
+rmdir tmp-$GOOS-$GOARCH
