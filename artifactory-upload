@@ -1,0 +1,28 @@
+#!/bin/bash
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <artifactory-repository> <filename>" 1>&2;
+    exit 1
+fi
+
+if [[ -z "$ART_API_KEY" ]]; then
+    echo "Environment variable ART_API_KEY must be set" 1>&2;
+    exit 1;
+fi
+
+ARTIFACTORY_REPOSITORY="$1"
+FILENAME="$2"
+
+URL="https://artifactory.jpl.nasa.gov/artifactory/${ARTIFACTORY_REPOSITORY}/gov/nasa/jpl/itsd/cloud/$FILENAME"
+echo "Uploading $FILENAME to $URL"
+
+HTTP_CODE=$(curl -H "X-JFrog-Art-Api:$ART_API_KEY" --silent --upload-file "$FILENAME" --output /dev/stderr --write-out '%{http_code}' $URL)
+
+# Force the CURL output to be newline terminated.
+echo "" 1>&2;
+
+if [[ $HTTP_CODE -lt 200 || $HTTP_CODE -gt 399 ]]; then
+	echo "Upload failed with HTTP code $HTTP_CODE" 1>&2;
+	exit 1;
+fi
+
+exit 0
