@@ -5,8 +5,8 @@ if [[ "$#" -ne 1 ]]; then
 fi;
 
 ZIP_TARGET="$1"
-export GOOS=$(echo $ZIP_TARGET | sed -E -e 's/^s3-tree-clone-([^-]+)-.*/\1/')
-export ARCH=$(echo $ZIP_TARGET | sed -E -e 's/^s3-tree-clone-[^-]+-([^-]+).*/\1/')
+export ARCH=$(echo $ZIP_TARGET | sed -E -e 's/^s3-tree-clone-([^-]+)-.*/\1/')
+export GOOS=$(echo $ZIP_TARGET | sed -E -e 's/^s3-tree-clone-[^-]+-([^-]+).*/\1/')
 
 case "$ARCH" in
     amd64 | x86_64 ) export GOARCH=amd64;;
@@ -14,15 +14,15 @@ case "$ARCH" in
     * ) export GOARCH="$ARCH";;
 esac;
 
-echo "Building s3-tree-clone-$GOOS-$ARCH"
-go build -o s3-tree-clone-$GOOS-$ARCH
+echo "Building s3-tree-clone-$ARCH-$GOOS"
+go build -o s3-tree-clone-$ARCH-$GOOS
 
 echo "Creating $ZIP_TARGET"
-rm -rf tmp-$GOOS-$ARCH
-mkdir -p tmp-$GOOS-$ARCH
-cp s3-tree-clone-$GOOS-$ARCH tmp-$GOOS-$ARCH/s3-tree-clone
-cd tmp-$GOOS-$ARCH
+rm -rf tmp-$ARCH-$GOOS
+mkdir -p tmp-$ARCH-$GOOS
+cp s3-tree-clone-$ARCH-$GOOS tmp-$ARCH-$GOOS/s3-tree-clone
+cd tmp-$ARCH-$GOOS
 zip -9 ../${ZIP_TARGET} s3-tree-clone
 rm -f s3-tree-clone
 cd ..
-rmdir tmp-$GOOS-$ARCH
+rmdir tmp-$ARCH-$GOOS
