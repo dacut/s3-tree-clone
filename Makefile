@@ -11,6 +11,9 @@ UPLOAD_TARGETS := $(foreach platform,$(PLATFORMS),upload-$(platform))
 
 all: $(ZIP_TARGETS)
 
+test:
+	go test
+
 upload: $(UPLOAD_TARGETS)
 
 upload-%: s3-tree-clone-%-$(VERSION).zip

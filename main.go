@@ -37,7 +37,7 @@ type S3TreeClone struct {
 	ctx              context.Context
 	sem              *semaphore.Weighted
 	waitGroup        *sync.WaitGroup
-	s3Client         *s3.Client
+	s3Client         S3Interface
 	storageClass     s3Types.StorageClass
 	encAlg           s3Types.ServerSideEncryption
 	ignoreTimestamps bool
@@ -56,82 +56,102 @@ type Hashes struct {
 	SHA512 []byte
 }
 
+// S3Interface encapsulates the required APIs for our functionality. We use this for unit testing.
+type S3Interface interface {
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	GetBucketLocation(context.Context, *s3.GetBucketLocationInput, ...func(*s3.Options)) (*s3.GetBucketLocationOutput, error)
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+}
+
 // main is the entrypoint for s3-tree-clone.
 func main() {
 	ctx := context.Background()
-	checkBucket := flag.Bool("check-bucket", true, "Call GetBucketLocation to verify the bucket location.")
-	region := flag.String("region", "", "The AWS region to use. Defaults to $AWS_REGION, $AWS_DEFAULT_REGION, the configured region for the profile, or the instance region, whichever is appropriate.")
-	profile := flag.String("profile", "", "The credentials profile to use.")
-	storageClass := flag.String("storage-class", "STANDARD", "The S3 storage class to use. One of 'STANDARD', 'STANDARD_IA', 'ONEZONE_IA', 'INTELLIGENT_TIERING', 'GLACIER', 'DEEP_ARCHIVE', or 'OUTPOSTS'.")
-	encAlg := flag.String("encryption-algorithm", "AES256", "The S3 server-side encryption algorithm to use. This must be either 'AES256' or 'aws:kms'.")
-	kmsKey := flag.String("kms-key", "aws/s3", "If -encryption-algorithm is 'aws:kms', the KMS key ID to use. Defaults to aws/s3.")
-	ignoreTimestamps := flag.Bool("ignore-timestamps", false, "Ignore file timestamps when comparing files.")
-	maxConcurrent := flag.Int("max-concurrent", 30, "The maximum number of concurrent S3 requests to make.")
-	maxRetries := flag.Int("max-retries", 10, "The maximum number of retries.")
-	maxBackoffDelayString := flag.String("max-backoff-delay", "60s", "The maximum retry backoff delay. Specify a duration such as '1.5m', '1m30s', etc.")
-	rootSquash := flag.Bool("root-squash", false, "Change files owned by root to nfsnobody.")
-	help := flag.Bool("help", false, "Show this usage information")
+	os.Exit(run(ctx, os.Args[1:], nil))
+}
+
+// run executes s3-tree-clone, but allows for test injection.
+func run(ctx context.Context, arguments []string, s3Client S3Interface) int {
+	flagSet := flag.NewFlagSet("s3-tree-clone", flag.ContinueOnError)
+
+	checkBucket := flagSet.Bool("check-bucket", true, "Call GetBucketLocation to verify the bucket location.")
+	region := flagSet.String("region", "", "The AWS region to use. Defaults to $AWS_REGION, $AWS_DEFAULT_REGION, the configured region for the profile, or the instance region, whichever is appropriate.")
+	profile := flagSet.String("profile", "", "The credentials profile to use.")
+	storageClass := flagSet.String("storage-class", "STANDARD", "The S3 storage class to use. One of 'STANDARD', 'STANDARD_IA', 'ONEZONE_IA', 'INTELLIGENT_TIERING', 'GLACIER', 'DEEP_ARCHIVE', or 'OUTPOSTS'.")
+	encAlg := flagSet.String("encryption-algorithm", "AES256", "The S3 server-side encryption algorithm to use. This must be either 'AES256' or 'aws:kms'.")
+	kmsKey := flagSet.String("kms-key", "aws/s3", "If -encryption-algorithm is 'aws:kms', the KMS key ID to use. Defaults to aws/s3.")
+	ignoreTimestamps := flagSet.Bool("ignore-timestamps", false, "Ignore file timestamps when comparing files.")
+	maxConcurrent := flagSet.Int("max-concurrent", 30, "The maximum number of concurrent S3 requests to make.")
+	maxRetries := flagSet.Int("max-retries", 10, "The maximum number of retries.")
+	maxBackoffDelayString := flagSet.String("max-backoff-delay", "60s", "The maximum retry backoff delay. Specify a duration such as '1.5m', '1m30s', etc.")
+	rootSquash := flagSet.Bool("root-squash", false, "Change files owned by root to nfsnobody.")
+	help := flagSet.Bool("help", false, "Show this usage information")
 	stc := S3TreeClone{ctx: ctx}
 
-	flag.Usage = func() {
-		var out = flag.CommandLine.Output()
-		fmt.Fprintf(out,
-			`s3-tree-clone [options] <src-dir> s3://<bucket>/<prefix>
-Copy the filesystem tree rooted at <src-dir> to the given S3 destination.
-If <prefix> is non-empty, it will have a slash appended if necessary.
-
-The <src-dir> argument is interpreted similarly to rsync: if it ends with a /,
-no directory is created in the S3 destination. If it does not end with a /,
-the directory at the end of <src-dir> is created.
-`)
-
-		flag.PrintDefaults()
+	if err := flagSet.Parse(arguments); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing arguments: %s\n", err)
+		printUsage(flagSet)
+		return 1
 	}
 
-	flag.Parse()
 	if *help {
-		flag.CommandLine.SetOutput(os.Stdout)
-		flag.Usage()
-		os.Exit(0)
+		flagSet.SetOutput(os.Stdout)
+		printUsage(flagSet)
+		return 0
 	}
 
-	args := flag.Args()
+	args := flagSet.Args()
 	if len(args) == 0 {
 		fmt.Fprintf(os.Stderr, "Missing source and destination\n")
-		flag.Usage()
-		os.Exit(1)
-	} else if len(args) == 1 {
+		printUsage(flagSet)
+		return 2
+	}
+
+	if len(args) == 1 {
 		fmt.Fprint(os.Stderr, "Missing destination\n")
-		flag.Usage()
-		os.Exit(1)
-	} else if len(args) > 2 {
+		printUsage(flagSet)
+		return 2
+	}
+
+	if len(args) > 2 {
 		fmt.Fprintf(os.Stderr, "Unexpected argument: %s\n", args[2])
-		flag.Usage()
-		os.Exit(1)
+		printUsage(flagSet)
+		return 2
 	}
 
 	var firstFilter string
 	stc.baseDir, firstFilter = path.Split(args[0])
 	dest := args[1]
 
+	if firstFilter == "." {
+		firstFilter = ""
+	}
+
+	if stc.baseDir == "" {
+		stc.baseDir = "."
+	}
+
 	err := stc.SetBucketAndPrefix(dest)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Destination must be an S3 URL\n")
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Destination is not a valid S3 URL: %s\n", dest)
+		return 2
 	}
 
 	if *storageClass != string(s3Types.StorageClassStandard) && *storageClass != string(s3Types.StorageClassStandardIa) && *storageClass != string(s3Types.StorageClassOnezoneIa) && *storageClass != string(s3Types.StorageClassIntelligentTiering) && *storageClass != string(s3Types.StorageClassGlacier) && *storageClass != string(s3Types.StorageClassDeepArchive) && *storageClass != string(s3Types.StorageClassOutposts) {
 		fmt.Fprintf(os.Stderr, "Invalid -storage-class value: %s\n", *storageClass)
-		flag.Usage()
-		os.Exit(1)
+		printUsage(flagSet)
+		return 1
 	}
 
 	stc.storageClass = s3Types.StorageClass(*storageClass)
 
 	if *encAlg != string(s3Types.ServerSideEncryptionAes256) && *encAlg != string(s3Types.ServerSideEncryptionAwsKms) {
 		fmt.Fprintf(os.Stderr, "Invalid -encryption-algorithm value: %s\n", *encAlg)
-		flag.Usage()
-		os.Exit(1)
+		printUsage(flagSet)
+		return 1
 	}
 
 	stc.encAlg = s3Types.ServerSideEncryption(*encAlg)
@@ -142,8 +162,8 @@ the directory at the end of <src-dir> is created.
 	// Check the -max-retries flag
 	if *maxRetries < 0 {
 		fmt.Fprintf(os.Stderr, "Invalid -max-retries value: %d\n", *maxRetries)
-		flag.Usage()
-		os.Exit(1)
+		printUsage(flagSet)
+		return 1
 	}
 
 	// Check the -max-backoff-delay flag
@@ -152,8 +172,8 @@ the directory at the end of <src-dir> is created.
 		maxBackoffDelay, err = time.ParseDuration(*maxBackoffDelayString)
 		if err != nil || maxBackoffDelay <= time.Duration(0) {
 			fmt.Fprintf(os.Stderr, "Invalid -max-backoff-delay value: %s\n", *maxBackoffDelayString)
-			flag.Usage()
-			os.Exit(1)
+			printUsage(flagSet)
+			return 1
 		}
 	}
 
@@ -176,7 +196,7 @@ the directory at the end of <src-dir> is created.
 	if *rootSquash {
 		err = stc.SetRootFromNFSNobody()
 		if err != nil {
-			os.Exit(1)
+			return 1
 		}
 	}
 
@@ -194,25 +214,29 @@ the directory at the end of <src-dir> is created.
 	}
 	configOptions = append(configOptions, config.WithRetryer(retrierFunc))
 
-	awsConfig, err := config.LoadDefaultConfig(ctx, configOptions...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load AWS config: %v\n", err)
-		os.Exit(1)
-	}
-
-	stc.s3Client = s3.NewFromConfig(awsConfig)
-
-	if *checkBucket {
-		err = stc.ReconfigureS3ClientFromBucketLocation(configOptions)
+	if s3Client != nil {
+		stc.s3Client = s3Client
+	} else {
+		awsConfig, err := config.LoadDefaultConfig(ctx, configOptions...)
 		if err != nil {
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "Failed to load AWS config: %v\n", err)
+			return 1
+		}
+
+		stc.s3Client = s3.NewFromConfig(awsConfig)
+
+		if *checkBucket {
+			err = stc.ReconfigureS3ClientFromBucketLocation(configOptions)
+			if err != nil {
+				return 1
+			}
 		}
 	}
 
 	sourceDir, err := os.OpenFile(stc.baseDir, os.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to open source directory %s: %v\n", stc.baseDir, err)
-		os.Exit(1)
+		return 1
 	}
 	sourceDir.Close()
 
@@ -222,10 +246,26 @@ the directory at the end of <src-dir> is created.
 	err = stc.WalkDirectory("", stc.baseDir, firstFilter)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "walkDirectory failed: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	stc.waitGroup.Wait()
+	return 0
+}
+
+func printUsage(flagSet *flag.FlagSet) {
+	var out = flagSet.Output()
+	fmt.Fprintf(out,
+		`s3-tree-clone [options] <src-dir> s3://<bucket>/<prefix>
+Copy the filesystem tree rooted at <src-dir> to the given S3 destination.
+If <prefix> is non-empty, it will have a slash appended if necessary.
+
+The <src-dir> argument is interpreted similarly to rsync: if it ends with a /,
+no directory is created in the S3 destination. If it does not end with a /,
+the directory at the end of <src-dir> is created.
+`)
+
+	flagSet.PrintDefaults()
 }
 
 func (stc *S3TreeClone) SetRootFromNFSNobody() error {
