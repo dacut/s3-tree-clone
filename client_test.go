@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,17 +43,40 @@ type s3TestBucket struct {
 	Name     string
 	Location s3Types.BucketLocationConstraint
 	Objects  map[string]*s3TestObject
+	Mutex    *sync.Mutex
 }
 
-type s3TestClientBase struct {
+type s3TestClient struct {
 	Buckets map[string]*s3TestBucket
+	Mutex   *sync.Mutex
 }
 
-func (c *s3TestClientBase) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput, opts ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+func newS3TestClient() *s3TestClient {
+	return &s3TestClient{
+		Buckets: make(map[string]*s3TestBucket),
+		Mutex:   &sync.Mutex{},
+	}
+}
+
+func (c *s3TestClient) createBucket(name string) *s3TestBucket {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+
+	bucket := &s3TestBucket{
+		Name:    name,
+		Objects: make(map[string]*s3TestObject),
+		Mutex:   &sync.Mutex{},
+	}
+
+	c.Buckets[name] = bucket
+	return bucket
+}
+
+func (c *s3TestClient) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput, opts ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
 	return &s3.AbortMultipartUploadOutput{}, nil
 }
 
-func (c *s3TestClientBase) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
+func (c *s3TestClient) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
 	return &s3.CompleteMultipartUploadOutput{
 		Bucket:               input.Bucket,
 		Location:             aws.String(fmt.Sprintf("https://%s/%s", *input.Bucket, *input.Key)),
@@ -62,7 +87,7 @@ func (c *s3TestClientBase) CompleteMultipartUpload(ctx context.Context, input *s
 	}, nil
 }
 
-func (c *s3TestClientBase) CreateMultipartUpload(ctx context.Context, input *s3.CreateMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
+func (c *s3TestClient) CreateMultipartUpload(ctx context.Context, input *s3.CreateMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
 	return &s3.CreateMultipartUploadOutput{
 		Bucket:               input.Bucket,
 		Key:                  input.Key,
@@ -71,7 +96,7 @@ func (c *s3TestClientBase) CreateMultipartUpload(ctx context.Context, input *s3.
 	}, nil
 }
 
-func (c *s3TestClientBase) GetBucketLocation(ctx context.Context, input *s3.GetBucketLocationInput, opts ...func(*s3.Options)) (*s3.GetBucketLocationOutput, error) {
+func (c *s3TestClient) GetBucketLocation(ctx context.Context, input *s3.GetBucketLocationInput, opts ...func(*s3.Options)) (*s3.GetBucketLocationOutput, error) {
 	if c.Buckets == nil {
 		c.Buckets = make(map[string]*s3TestBucket)
 	}
@@ -87,21 +112,21 @@ func (c *s3TestClientBase) GetBucketLocation(ctx context.Context, input *s3.GetB
 	}, nil
 }
 
-func (c *s3TestClientBase) HeadObject(ctx context.Context, input *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+func (c *s3TestClient) HeadObject(ctx context.Context, input *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
 	if c.Buckets == nil {
 		c.Buckets = make(map[string]*s3TestBucket)
 	}
 
+	c.Mutex.Lock()
 	bucket, found := c.Buckets[*input.Bucket]
+	c.Mutex.Unlock()
 	if !found {
 		return nil, makeS3Error("HeadObject", 404, "Not Found", "NotFound", "Not Found")
 	}
 
-	if bucket.Objects == nil {
-		bucket.Objects = make(map[string]*s3TestObject)
-	}
-
+	bucket.Mutex.Lock()
 	object, found := bucket.Objects[*input.Key]
+	bucket.Mutex.Unlock()
 	if !found {
 		return nil, makeS3Error("HeadObject", 404, "Not Found", "NotFound", "Not Found")
 	}
@@ -124,7 +149,7 @@ func (c *s3TestClientBase) HeadObject(ctx context.Context, input *s3.HeadObjectI
 	}, nil
 }
 
-func (stc *s3TestClientBase) PutObject(ctx context.Context, input *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+func (stc *s3TestClient) PutObject(ctx context.Context, input *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	bucket, found := stc.Buckets[*input.Bucket]
 	if !found {
 		bucket = &s3TestBucket{
@@ -159,7 +184,10 @@ func (stc *s3TestClientBase) PutObject(ctx context.Context, input *s3.PutObjectI
 		VersionId:          aws.String("000000000000"),
 	}
 
+	bucket.Mutex.Lock()
 	bucket.Objects[*input.Key] = object
+	bucket.Mutex.Unlock()
+	fmt.Fprintf(os.Stderr, "S3TestClient: Wrote object s3://%s/%s\n", *input.Bucket, *input.Key)
 
 	return &s3.PutObjectOutput{
 		ETag:                 copyAWSString(object.ETag),
@@ -168,7 +196,7 @@ func (stc *s3TestClientBase) PutObject(ctx context.Context, input *s3.PutObjectI
 	}, nil
 }
 
-func (stc *s3TestClientBase) UploadPart(ctx context.Context, input *s3.UploadPartInput, opts ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+func (stc *s3TestClient) UploadPart(ctx context.Context, input *s3.UploadPartInput, opts ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
 	return &s3.UploadPartOutput{
 		ETag:                 aws.String("\"00000000000000000000000000000000\""),
 		ServerSideEncryption: s3Types.ServerSideEncryptionAes256,
@@ -197,10 +225,6 @@ func (stre *S3TestResponseError) ServiceRequestID() string {
 
 func (stre *S3TestResponseError) As(target interface{}) bool {
 	return errors.As(stre.ResponseError, target)
-}
-
-type testEmptyDotDirClient struct {
-	s3TestClientBase
 }
 
 func makeS3Error(operation string, statusCode int, statusReason, errorCode, errorMessage string) *smithy.OperationError {

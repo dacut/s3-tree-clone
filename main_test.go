@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -118,10 +119,8 @@ func TestEmptyDotDir(t *testing.T) {
 		t.Fatalf("Failed to chdir to temporary directory %s: %v", tmpDir, err)
 	}
 
-	client := &testEmptyDotDirClient{}
-	client.Buckets = make(map[string]*s3TestBucket)
-	bucket := &s3TestBucket{Name: "hello"}
-	client.Buckets["hello"] = bucket
+	client := newS3TestClient()
+	client.createBucket("hello")
 	runExpect(t, []string{".", "s3://hello"}, client, 0, nil, nil)
 }
 
@@ -157,10 +156,8 @@ func TestDotDirWithFiles(t *testing.T) {
 		}
 	}
 
-	client := &testEmptyDotDirClient{}
-	client.Buckets = make(map[string]*s3TestBucket)
-	bucket := &s3TestBucket{Name: "hello"}
-	client.Buckets["hello"] = bucket
+	client := newS3TestClient()
+	bucket := client.createBucket("hello")
 	runExpect(t, []string{".", "s3://hello"}, client, 0, nil, nil)
 
 	for i := 0; i < 100; i++ {
@@ -172,6 +169,89 @@ func TestDotDirWithFiles(t *testing.T) {
 
 		if obj.ContentLength != 5 {
 			t.Errorf("Expected Content-Length of %s to be 5: %d", key, obj.ContentLength)
+		}
+	}
+}
+
+func TestNestedDirs(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get working directory: %v", err)
+	}
+	defer func() {
+		err := os.Chdir(oldWD)
+		if err != nil {
+			t.Fatalf("Failed to chdir back to %s: %v", oldWD, err)
+		}
+	}()
+
+	tmpDir, err := os.MkdirTemp("", "test-empty-dot-dir-")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	err = os.Chdir(tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to chdir to temporary directory %s: %v", tmpDir, err)
+	}
+
+	err = os.MkdirAll("d1/d2/d3", fs.FileMode(0755))
+	if err != nil {
+		t.Fatalf("Failed to create d1/d2/d3: %v", err)
+	}
+
+	err = ioutil.WriteFile("d1/d2/d3/hello.txt", []byte("hello"), 0644)
+	if err != nil {
+		t.Fatalf("Failed to write d1/d2/d3/hello.txt: %v", err)
+	}
+
+	client := newS3TestClient()
+	bucket := client.createBucket("hello")
+	returnCode := run(context.Background(), []string{"--verbose", ".", "s3://hello"}, client)
+	if returnCode != 0 {
+		t.Errorf("Expected return code of 0, got %d", returnCode)
+	}
+
+	bucket.Mutex.Lock()
+	defer bucket.Mutex.Unlock()
+	var obj *s3TestObject
+	var found bool
+
+	obj, found = bucket.Objects["d1/"]
+	if !found {
+		t.Errorf("Expected to find object d1/ in bucket %s", bucket.Name)
+	} else {
+		if obj.ContentLength != 0 {
+			t.Errorf("Expected Content-Length of d1/ to be 0: %d", obj.ContentLength)
+		}
+	}
+
+	obj, found = bucket.Objects["d1/d2/"]
+	if !found {
+		t.Errorf("Expected to find object d1/d2/ in bucket %s", bucket.Name)
+	} else {
+		if obj.ContentLength != 0 {
+			t.Errorf("Expected Content-Length of d1/d2/ to be 0: %d", obj.ContentLength)
+		}
+	}
+
+	obj, found = bucket.Objects["d1/d2/d3/"]
+	if !found {
+		t.Errorf("Expected to find object d1/d2/d3/ in bucket %s", bucket.Name)
+	} else {
+		if obj.ContentLength != 0 {
+			t.Errorf("Expected Content-Length of d1/d2/d3 to be 0: %d", obj.ContentLength)
+		}
+	}
+
+	obj, found = bucket.Objects["d1/d2/d3/hello.txt"]
+	if !found {
+		t.Errorf("Expected to find object d1/d2/d3/hello.txt in bucket %s", bucket.Name)
+	} else {
+		if obj.ContentLength != 5 {
+			t.Errorf("Expected Content-Length of d1/d2/d3/hello.txt to be 5: %d", obj.ContentLength)
 		}
 	}
 }

@@ -47,6 +47,7 @@ type S3TreeClone struct {
 	rootUID          uint32
 	rootGID          uint32
 	baseDir          string
+	verbose          bool
 }
 
 type Hashes struct {
@@ -88,7 +89,8 @@ func run(ctx context.Context, arguments []string, s3Client S3Interface) int {
 	maxRetries := flagSet.Int("max-retries", 10, "The maximum number of retries.")
 	maxBackoffDelayString := flagSet.String("max-backoff-delay", "60s", "The maximum retry backoff delay. Specify a duration such as '1.5m', '1m30s', etc.")
 	rootSquash := flagSet.Bool("root-squash", false, "Change files owned by root to nfsnobody.")
-	help := flagSet.Bool("help", false, "Show this usage information")
+	help := flagSet.Bool("help", false, "Show this usage information.")
+	verbose := flagSet.Bool("verbose", false, "Show verbose details.")
 	stc := S3TreeClone{ctx: ctx}
 
 	if err := flagSet.Parse(arguments); err != nil {
@@ -158,6 +160,7 @@ func run(ctx context.Context, arguments []string, s3Client S3Interface) int {
 	stc.kmsKey = *kmsKey
 
 	stc.ignoreTimestamps = *ignoreTimestamps
+	stc.verbose = *verbose
 
 	// Check the -max-retries flag
 	if *maxRetries < 0 {
@@ -390,9 +393,13 @@ func (stc *S3TreeClone) HandleFile(relPath, dirName, filename string) {
 	}
 	stat := fileinfo.Sys().(*syscall.Stat_t)
 	mode := fileinfo.Mode()
+	uploadRequired := false
 
 	if !mode.IsDir() && !mode.IsRegular() {
 		// Skip devices, pipes, sockets, etc.
+		if stc.verbose {
+			fmt.Printf("Skipping non-regular file %s\n", pathname)
+		}
 		return
 	}
 
@@ -409,6 +416,11 @@ func (stc *S3TreeClone) HandleFile(relPath, dirName, filename string) {
 		fmt.Fprintf(os.Stderr, "Unable to acquire S3 semaphore: %v\n", err)
 		return
 	}
+
+	if stc.verbose {
+		fmt.Printf("Comparing %s against s3://%s/%s\n", pathname, stc.bucket, key)
+	}
+
 	hoo, err := stc.s3Client.HeadObject(stc.ctx, &s3.HeadObjectInput{Bucket: &stc.bucket, Key: &key})
 	stc.sem.Release(1)
 
@@ -425,40 +437,42 @@ func (stc *S3TreeClone) HandleFile(relPath, dirName, filename string) {
 		if showError {
 			fmt.Fprintf(os.Stderr, "HeadObject on s3://%s/%s failed; will resync object: %v\n", stc.bucket, key,
 				err)
+		} else if stc.verbose {
+			fmt.Printf("s3://%s/%s does not exist; will resync object\n", stc.bucket, key)
 		}
 
-		if mode.IsDir() {
-			stc.UploadDir(pathname, key, stat)
-		} else {
-			stc.UploadFile(pathname, key, stat, nil)
-		}
-
-		return
-	}
-
-	if !stc.FileMetadataEqual(hoo, stat, pathname, key, mode.IsDir()) {
-		if mode.IsDir() {
-			stc.UploadDir(pathname, key, stat)
-		} else {
-			stc.UploadFile(pathname, key, stat, nil)
-		}
-		return
+		uploadRequired = true
+	} else if !stc.FileMetadataEqual(hoo, stat, pathname, key, mode.IsDir()) {
+		uploadRequired = true
 	}
 
 	if !mode.IsDir() {
 		// Get the hashes for the file.
-		hashes, hashesEqual, err := compareFileHashes(hoo, pathname)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Unable to get hashes for %s: %v\n", pathname, err)
-			return
+		var hashes *Hashes
+
+		if hoo != nil {
+			var hashesEqual bool
+			hashes, hashesEqual, err = compareFileHashes(hoo, pathname)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Unable to get hashes for %s: %v\n", pathname, err)
+				return
+			}
+
+			if !hashesEqual {
+				fmt.Fprintf(os.Stderr, "File hashes differ for s3://%s/%s and %s; will resync object\n", stc.bucket, key, pathname)
+				uploadRequired = true
+			} else if stc.verbose {
+				fmt.Printf("Hash values for %s and s3://%s/%s match\n", pathname, stc.bucket, key)
+			}
 		}
 
-		if !hashesEqual {
-			fmt.Fprintf(os.Stderr, "File hashes differ for s3://%s/%s and %s; will resync object\n", stc.bucket, key, pathname)
+		if uploadRequired {
 			stc.UploadFile(pathname, key, stat, hashes)
-			return
 		}
 	} else {
+		if uploadRequired {
+			stc.UploadDir(pathname, key, stat)
+		}
 		// Walk this directory
 		fmt.Fprintf(os.Stderr, "Walking directory %s\n", pathname)
 		subdir := path.Join(relPath, filename)
@@ -513,6 +527,10 @@ func (stc *S3TreeClone) FileMetadataEqual(hoo *s3.HeadObjectOutput, stat *syscal
 		if !fileTimestampEqual(hoo, getCtime(stat), stc.bucket, key, pathname, "file-ctime") || !fileTimestampEqual(hoo, getMtime(stat), stc.bucket, key, pathname, "file-mtime") {
 			return false
 		}
+	}
+
+	if stc.verbose {
+		fmt.Printf("Metadata for %s and s3://%s/%s matches\n", pathname, stc.bucket, key)
 	}
 
 	return true
